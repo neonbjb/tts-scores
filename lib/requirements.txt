@@ -1,0 +1,6 @@
+torch
+einops
+transformers
+tokenizers
+scipy
+pytorch_fid
