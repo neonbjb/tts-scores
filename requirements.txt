@@ -4,3 +4,7 @@ transformers
 tokenizers
 scipy
 pytorch_fid
+tqdm
+inflect
+unidecode
+requests

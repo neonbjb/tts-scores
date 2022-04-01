@@ -1,12 +1,11 @@
 import os.path
 
 import torch
-import torchaudio
 from tqdm import tqdm
 from transformers import Wav2Vec2ForCTC
 
-from lib.tokenizer import text_to_sequence
-from lib.utils import load_tsv, load_audio
+from tts_scores.tokenizer import text_to_sequence
+from tts_scores.utils import load_tsv, load_audio
 
 
 class IntelligibilityMetric:

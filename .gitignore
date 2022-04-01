@@ -1,1 +1,3 @@
 .idea/*
+dist/*
+tts_scores.egg-info/*

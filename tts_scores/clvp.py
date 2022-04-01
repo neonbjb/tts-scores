@@ -14,8 +14,8 @@ from pytorch_fid.fid_score import calculate_frechet_distance
 from torch import nn, einsum
 from tqdm import tqdm
 
-from lib.tokenizer import text_to_sequence
-from lib.utils import load_audio, to_mel, load_tsv
+from tts_scores.tokenizer import text_to_sequence
+from tts_scores.utils import load_audio, to_mel, load_tsv
 
 
 def exists(val):
