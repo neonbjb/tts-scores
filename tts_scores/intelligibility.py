@@ -48,5 +48,7 @@ class IntelligibilityMetric:
                 assert os.path.exists(real_path), real_path
                 real_audio = load_audio(str(real_path), 16000).to(self.device)[:1]
                 il = il - self.fetch_ctc_loss(real_audio, text_codes)
+            if torch.isnan(il) or torch.isinf(il):
+                continue
             ils.append(il)
         return torch.stack(ils).mean()
