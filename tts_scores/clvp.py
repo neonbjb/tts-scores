@@ -1,343 +1,276 @@
-"""
-Contrastive Transformer model trained for associating text and voice clips.
-Closely based on the work of lucidrains in his DALLE repo:
-https://github.com/lucidrains/DALLE-pytorch
-"""
-
+import math
+import os.path
 import pathlib
+from random import random
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange
 from pytorch_fid.fid_score import calculate_frechet_distance
-from torch import nn, einsum
+from torch import einsum, distributed
+from torch.distributed import get_world_size
+from torch.utils.checkpoint import checkpoint
 from tqdm import tqdm
 
-from tts_scores.tokenizer import text_to_sequence
+from tts_scores.transformers import ContinuousTransformerWrapper, Encoder
+from tts_scores.tokenizer import text_to_sequence, VoiceBpeTokenizer
 from tts_scores.utils import load_audio, to_mel, load_tsv
+
+
+class GroupNorm32(nn.GroupNorm):
+    def forward(self, x):
+        return super().forward(x.float()).type(x.dtype)
+
+
+def conv_nd(dims, *args, **kwargs):
+    """
+    Create a 1D, 2D, or 3D convolution module.
+    """
+    if dims == 1:
+        return nn.Conv1d(*args, **kwargs)
+    elif dims == 2:
+        return nn.Conv2d(*args, **kwargs)
+    elif dims == 3:
+        return nn.Conv3d(*args, **kwargs)
+    raise ValueError(f"unsupported dimensions: {dims}")
+
+
+def normalization(channels):
+    """
+    Make a standard normalization layer.
+
+    :param channels: number of input channels.
+    :return: an nn.Module for normalization.
+    """
+    groups = 32
+    if channels <= 16:
+        groups = 8
+    elif channels <= 64:
+        groups = 16
+    while channels % groups != 0:
+        groups = int(groups / 2)
+    assert groups > 2
+    return GroupNorm32(groups, channels)
+
+
+def zero_module(module):
+    """
+    Zero out the parameters of a module and return it.
+    """
+    for p in module.parameters():
+        p.detach().zero_()
+    return module
+
+
+class AttentionBlock(nn.Module):
+    """
+    An attention block that allows spatial positions to attend to each other.
+
+    Originally ported from here, but adapted to the N-d case.
+    https://github.com/hojonathanho/diffusion/blob/1e0dceb3b3495bbe19116a5e1b3596cd0706c543/diffusion_tf/models/unet.py#L66.
+    """
+
+    def __init__(
+        self,
+        channels,
+        num_heads=1,
+        num_head_channels=-1,
+        do_checkpoint=True,
+    ):
+        super().__init__()
+        self.channels = channels
+        self.do_checkpoint = do_checkpoint
+        if num_head_channels == -1:
+            self.num_heads = num_heads
+        else:
+            assert (
+                channels % num_head_channels == 0
+            ), f"q,k,v channels {channels} is not divisible by num_head_channels {num_head_channels}"
+            self.num_heads = channels // num_head_channels
+        self.norm = normalization(channels)
+        self.qkv = conv_nd(1, channels, channels * 3, 1)
+        self.attention = QKVAttentionLegacy(self.num_heads)
+
+        self.proj_out = zero_module(conv_nd(1, channels, channels, 1))
+
+    def forward(self, x, mask=None):
+        if self.do_checkpoint:
+            if mask is not None:
+                return checkpoint(self._forward, x, mask)
+            else:
+                return checkpoint(self._forward, x)
+        else:
+            return self._forward(x, mask)
+
+    def _forward(self, x, mask=None):
+        b, c, *spatial = x.shape
+        x = x.reshape(b, c, -1)
+        qkv = self.qkv(self.norm(x))
+        h = self.attention(qkv, mask)
+        h = self.proj_out(h)
+        return (x + h).reshape(b, c, *spatial)
+
+
+class QKVAttentionLegacy(nn.Module):
+    """
+    A module which performs QKV attention. Matches legacy QKVAttention + input/ouput heads shaping
+    """
+
+    def __init__(self, n_heads):
+        super().__init__()
+        self.n_heads = n_heads
+
+    def forward(self, qkv, mask=None):
+        """
+        Apply QKV attention.
+
+        :param qkv: an [N x (H * 3 * C) x T] tensor of Qs, Ks, and Vs.
+        :return: an [N x (H * C) x T] tensor after attention.
+        """
+        bs, width, length = qkv.shape
+        assert width % (3 * self.n_heads) == 0
+        ch = width // (3 * self.n_heads)
+        q, k, v = qkv.reshape(bs * self.n_heads, ch * 3, length).split(ch, dim=1)
+        scale = 1 / math.sqrt(math.sqrt(ch))
+        weight = torch.einsum(
+            "bct,bcs->bts", q * scale, k * scale
+        )  # More stable with f16 than dividing afterwards
+        weight = torch.softmax(weight.float(), dim=-1).type(weight.dtype)
+        if mask is not None:
+            # The proper way to do this is to mask before the softmax using -inf, but that doesn't work properly on CPUs.
+            mask = mask.repeat(self.n_heads, 1).unsqueeze(1)
+            weight = weight * mask
+        a = torch.einsum("bts,bcs->bct", weight, v)
+
+        return a.reshape(bs, -1, length)
 
 
 def exists(val):
     return val is not None
 
 
-def masked_mean(t, mask, dim = 1):
-    t = t.masked_fill(~mask[:, :, None], 0.)
-    return t.sum(dim = 1) / mask.sum(dim = 1)[..., None]
+def masked_mean(t, mask):
+    t = t.masked_fill(~mask, 0.)
+    return t.sum(dim = 1) / mask.sum(dim = 1)
 
 
-def default(val, d):
-    return val if exists(val) else d
-
-
-def cast_tuple(val, depth = 1):
-    if isinstance(val, list):
-        val = tuple(val)
-    return val if isinstance(val, tuple) else (val,) * depth
-
-
-def max_neg_value(t):
-    return -torch.finfo(t.dtype).max
-
-
-def route_args(router, args, depth):
-    routed_args = [(dict(), dict()) for _ in range(depth)]
-    matched_keys = [key for key in args.keys() if key in router]
-
-    for key in matched_keys:
-        val = args[key]
-        for depth, ((f_args, g_args), routes) in enumerate(zip(routed_args, router[key])):
-            new_f_args, new_g_args = map(lambda route: ({key: val} if route else {}), routes)
-            routed_args[depth] = ({**f_args, **new_f_args}, {**g_args, **new_g_args})
-    return routed_args
-
-
-class DivideMax(nn.Module):
-    def __init__(self, dim):
+class CollapsingTransformer(nn.Module):
+    def __init__(self, model_dim, output_dims, heads, dropout, depth, mask_percentage=0, **encoder_kwargs):
         super().__init__()
-        self.dim = dim
+        self.transformer = ContinuousTransformerWrapper(
+            max_seq_len=-1,
+            use_pos_emb=False,
+            attn_layers=Encoder(
+                dim=model_dim,
+                depth=depth,
+                heads=heads,
+                ff_dropout=dropout,
+                ff_mult=1,
+                attn_dropout=dropout,
+                use_rmsnorm=True,
+                ff_glu=True,
+                rotary_pos_emb=True,
+                **encoder_kwargs,
+            ))
+        self.pre_combiner = nn.Sequential(nn.Conv1d(model_dim, output_dims, 1),
+                                          AttentionBlock(output_dims, num_heads=heads, do_checkpoint=False),
+                                          nn.Conv1d(output_dims, output_dims, 1))
+        self.mask_percentage = mask_percentage
 
-    def forward(self, x):
-        maxes = x.amax(dim = self.dim, keepdim = True).detach()
-        return x / maxes
-
-
-class LayerScale(nn.Module):
-    def __init__(self, dim, depth, fn):
-        super().__init__()
-        if depth <= 18:
-            init_eps = 0.1
-        elif depth > 18 and depth <= 24:
-            init_eps = 1e-5
+    def forward(self, x, **transformer_kwargs):
+        h = self.transformer(x, **transformer_kwargs)
+        h = h.permute(0,2,1)
+        h = checkpoint(self.pre_combiner, h).permute(0,2,1)
+        if self.training:
+            mask = torch.rand_like(h.float()) > self.mask_percentage
         else:
-            init_eps = 1e-6
-
-        scale = torch.zeros(1, 1, dim).fill_(init_eps)
-        self.scale = nn.Parameter(scale)
-        self.fn = fn
-
-    def forward(self, x, **kwargs):
-        return self.fn(x, **kwargs) * self.scale
+            mask = torch.ones_like(h.float()).bool()
+        return masked_mean(h, mask)
 
 
-class PreNorm(nn.Module):
-    def __init__(self, dim, fn, sandwich = False):
+class ConvFormatEmbedding(nn.Module):
+    def __init__(self, *args, **kwargs):
         super().__init__()
-        self.norm = nn.LayerNorm(dim)
-        self.norm_out = nn.LayerNorm(dim) if sandwich else nn.Identity()
-        self.fn = fn
-
-    def forward(self, x, **kwargs):
-        x = self.norm(x)
-        x = self.fn(x, **kwargs)
-        return self.norm_out(x)
-
-
-class GEGLU(nn.Module):
-    def forward(self, x):
-        x, gates = x.chunk(2, dim = -1)
-        return x * F.gelu(gates)
-
-
-class FeedForward(nn.Module):
-    def __init__(self, dim, dropout = 0., mult = 4.):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(dim, dim * mult * 2),
-            GEGLU(),
-            nn.Dropout(dropout),
-            nn.Linear(dim * mult, dim)
-        )
+        self.emb = nn.Embedding(*args, **kwargs)
 
     def forward(self, x):
-        return self.net(x)
-
-
-class SequentialSequence(nn.Module):
-    def __init__(self, layers, args_route = {}, layer_dropout = 0.):
-        super().__init__()
-        assert all(len(route) == len(layers) for route in args_route.values()), 'each argument route map must have the same depth as the number of sequential layers'
-        self.layers = layers
-        self.args_route = args_route
-        self.layer_dropout = layer_dropout
-
-    def forward(self, x, **kwargs):
-        args = route_args(self.args_route, kwargs, len(self.layers))
-        layers_and_args = list(zip(self.layers, args))
-
-        for (f, g), (f_args, g_args) in layers_and_args:
-            x = x + f(x, **f_args)
-            x = x + g(x, **g_args)
-        return x
-
-
-class PreShiftToken(nn.Module):
-    def __init__(self, fn, image_size, seq_len):
-        super().__init__()
-        self.fn = fn
-        self.image_size = image_size
-        self.seq_len = seq_len
-
-    def forward(self, x, **kwargs):
-        n = x.shape[1]
-        seq_len, image_size = self.seq_len, self.image_size
-        img_seq_len = image_size ** 2
-        text_len = seq_len - img_seq_len + 1
-        padding = seq_len - n + 1
-
-        # get text and image tokens
-
-        x_text, x_img = x[:, :text_len], x[:, text_len:]
-        x_img = F.pad(x_img, (0, 0, 0, padding))
-        x_img = rearrange(x_img, 'b (h w) d -> b h w d', h = image_size)
-
-        # shift 1 from the left for text tokens
-
-        x_text_shift, x_text_pass = x_text.chunk(2, dim = -1)
-        x_text_shift = F.pad(x_text_shift, (0, 0, 1, -1))
-        x_text = torch.cat((x_text_shift, x_text_pass), dim = -1)
-
-        # shift from top, left for image tokens
-
-        x_img_shift_top, x_img_shift_left, *x_img_pass = x_img.chunk(4, dim = -1)
-        x_img_shift_left = F.pad(x_img_shift_left, (0, 0, 1, -1))
-        x_img_shift_top = F.pad(x_img_shift_top, (0, 0, 0, 0, 1, -1))
-        x_img = torch.cat((x_img_shift_top, x_img_shift_left, *x_img_pass), dim = -1)
-
-        # merge text and image sequence back together
-
-        x_img = rearrange(x_img, 'b h w d -> b (h w) d')
-        x = torch.cat((x_text, x_img[:, :-padding]), dim = 1)
-        return self.fn(x, **kwargs)
-
-
-class Attention(nn.Module):
-    def __init__(self, dim, seq_len, causal = True, heads = 8, dim_head = 64, dropout = 0., stable = False):
-        super().__init__()
-        inner_dim = dim_head *  heads
-        self.heads = heads
-        self.seq_len = seq_len
-        self.scale = dim_head ** -0.5
-
-        self.stable = stable
-        self.causal = causal
-
-        self.to_qkv = nn.Linear(dim, inner_dim * 3, bias = False)
-        self.to_out = nn.Sequential(
-            nn.Linear(inner_dim, dim),
-            nn.Dropout(dropout)
-        )
-
-    def forward(self, x, mask = None):
-        b, n, _, h, device = *x.shape, self.heads, x.device
-        softmax = torch.softmax if not self.stable else stable_softmax
-
-        qkv = self.to_qkv(x).chunk(3, dim = -1)
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = h), qkv)
-
-        q = q * self.scale
-
-        dots = torch.einsum('b h i d, b h j d -> b h i j', q, k)
-        mask_value = max_neg_value(dots)
-
-        if exists(mask):
-            mask = rearrange(mask, 'b j -> b () () j')
-            dots.masked_fill_(~mask, mask_value)
-            del mask
-
-        if self.causal:
-            i, j = dots.shape[-2:]
-            mask = torch.ones(i, j, device = device).triu_(j - i + 1).bool()
-            dots.masked_fill_(mask, mask_value)
-
-        attn = softmax(dots, dim=-1)
-
-        out = torch.einsum('b h i j, b h j d -> b h i d', attn, v)
-        out = rearrange(out, 'b h n d -> b n (h d)')
-        out =  self.to_out(out)
-        return out
-
-
-class Transformer(nn.Module):
-    def __init__(
-        self,
-        *,
-        dim,
-        depth,
-        seq_len,
-        heads=8,
-        dim_head=64,
-        ff_mult=4,
-        attn_dropout=0.,
-        ff_dropout=0.,
-    ):
-        super().__init__()
-        layers = nn.ModuleList([])
-
-        for ind in range(depth):
-            attn = Attention(dim, causal=False, seq_len=seq_len, heads=heads, dim_head=dim_head, dropout=attn_dropout)
-            ff = FeedForward(dim, mult=ff_mult, dropout=ff_dropout)
-            layers.append(nn.ModuleList([
-                LayerScale(dim, ind + 1, PreNorm(dim, attn)),
-                LayerScale(dim, ind + 1, PreNorm(dim, ff))
-            ]))
-
-        execute_type = SequentialSequence
-        route_attn = ((True, False),) * depth
-        attn_route_map = {'mask': route_attn}
-        self.layers = execute_type(layers, args_route=attn_route_map)
-
-    def forward(self, x, **kwargs):
-        return self.layers(x, **kwargs)
+        y = self.emb(x)
+        return y.permute(0,2,1)
 
 
 class CLVP(nn.Module):
+    """
+    Contrastic Language-Voice Pretraining model for generating embedding that can be used to associate text and
+    speech clips.
+    """
+
     def __init__(
             self,
-            *,
-            dim_text=512,
-            dim_speech=512,
-            dim_latent=512,
+            model_dim=512,
+            transformer_heads=8,
+            dropout=.1,
             num_text_tokens=256,
             text_enc_depth=6,
-            text_seq_len=120,
-            text_heads=8,
-            num_speech_tokens=8192,
-            speech_enc_depth=6,
-            speech_heads=8,
-            speech_seq_len=250,
             text_mask_percentage=0,
-            voice_mask_percentage=0,
-            mel_compression=256,
+            conditioning_enc_depth=4,
+            mel_channels=80,
+            mel_codes=None,
+            speech_enc_depth=6,
+            speech_mask_percentage=0,
+            latent_multiplier=4,
+            is_distributed=False,
     ):
         super().__init__()
-        self.text_emb = nn.Embedding(num_text_tokens, dim_text)
-        self.text_pos_emb = nn.Embedding(text_seq_len, dim_text)
-        self.text_transformer = Transformer( seq_len=text_seq_len, dim=dim_text, depth=text_enc_depth,
-                                            heads=text_heads)
-        self.to_text_latent = nn.Linear(dim_text, dim_latent, bias=False)
-
-        self.speech_enc = nn.Conv1d(80, dim_speech, kernel_size=3, padding=1)
-        self.speech_pos_emb = nn.Embedding(num_speech_tokens, dim_speech)
-        self.speech_transformer = Transformer(seq_len=speech_seq_len, dim=dim_speech,
-                                              depth=speech_enc_depth, heads=speech_heads)
-        self.to_speech_latent = nn.Linear(dim_speech, dim_latent, bias=False)
-
+        latent_dim = latent_multiplier*model_dim
         self.temperature = nn.Parameter(torch.tensor(1.))
-        self.text_mask_percentage = text_mask_percentage
-        self.voice_mask_percentage = voice_mask_percentage
-        self.mel_compression = mel_compression
 
-    def get_text_projections(self, text, text_mask=None):
-        if text_mask is None:
-            text_mask = torch.ones_like(text.float()).bool()
-        text_emb = self.text_emb(text)
-        text_emb += self.text_pos_emb(torch.arange(text.shape[1], device=text.device))
-        enc_text = self.text_transformer(text_emb, mask=text_mask)
-        text_latents = masked_mean(enc_text, text_mask, dim=1)
-        return self.to_text_latent(text_latents).float()
+        self.cond_emb = nn.Sequential(nn.Conv1d(mel_channels, model_dim//2, kernel_size=5, stride=2, padding=2),
+                                      nn.Conv1d(model_dim//2, model_dim, kernel_size=3, stride=2, padding=1))
+        self.conditioning_transformer = CollapsingTransformer(model_dim, model_dim*2, transformer_heads, dropout, conditioning_enc_depth, 0)
 
-    def get_speech_projection(self, mel, voice_mask=None):
-        if voice_mask is None:
-            voice_mask = torch.ones_like(mel[:,0,:].float()).bool()
-        speech_emb = self.speech_enc(mel).permute(0,2,1)
-        speech_emb += self.speech_pos_emb(torch.arange(speech_emb.shape[1], device=mel.device))
-        enc_speech = self.speech_transformer(speech_emb, mask=voice_mask)
-        speech_latents = masked_mean(enc_speech, voice_mask, dim=1)
-        return self.to_speech_latent(speech_latents).float()
+        self.text_emb = nn.Embedding(num_text_tokens, model_dim)
+        self.text_transformer = CollapsingTransformer(model_dim, latent_dim, transformer_heads, dropout, text_enc_depth, text_mask_percentage, use_rms_scaleshift_norm=True)
+        self.to_text_latent = nn.Linear(latent_dim, latent_dim, bias=False)
+
+        self.distributed = is_distributed
+
+        if mel_codes is None:
+            self.speech_emb = nn.Conv1d(mel_channels, model_dim, kernel_size=5, padding=2)
+        else:
+            self.speech_emb = ConvFormatEmbedding(mel_codes, model_dim)
+        self.speech_transformer = CollapsingTransformer(model_dim, latent_dim, transformer_heads, dropout, speech_enc_depth, speech_mask_percentage)
+        self.to_speech_latent = nn.Linear(latent_dim, latent_dim, bias=False)
+
+    def get_grad_norm_parameter_groups(self):
+        return {
+            'conditioning': list(self.conditioning_transformer.parameters()),
+            'text': list(self.text_transformer.parameters()),
+            'speech': list(self.speech_transformer.parameters()),
+        }
 
     def forward(
             self,
             text,
-            mel,
+            mel_input,
+            mel_cond,
             return_loss=False
     ):
-        b, device = text.shape[0], text.device
-        if self.training:
-            text_mask = torch.rand_like(text.float()) > self.text_mask_percentage
-            voice_mask = torch.rand_like(mel[:,0,:].float()) > self.voice_mask_percentage
-        else:
-            text_mask = torch.ones_like(text.float()).bool()
-            voice_mask = torch.ones_like(mel[:,0,:].float()).bool()
+        device = text.device
 
         text_emb = self.text_emb(text)
-        text_emb += self.text_pos_emb(torch.arange(text.shape[1], device=device))
+        speech_emb = self.speech_emb(mel_input).permute(0,2,1)
 
-        speech_emb = self.speech_enc(mel).permute(0,2,1)
-        speech_emb += self.speech_pos_emb(torch.arange(speech_emb.shape[1], device=device))
+        unused_params = []
+        cond_emb = self.cond_emb(mel_cond).permute(0,2,1)
+        enc_cond = self.conditioning_transformer(cond_emb)
+        enc_text = self.text_transformer(text_emb, norm_scale_shift_inp=enc_cond)
+        enc_speech = self.speech_transformer(speech_emb)
 
-        enc_text = self.text_transformer(text_emb, mask=text_mask)
-        enc_speech = self.speech_transformer(speech_emb, mask=voice_mask)
-
-        text_latents = masked_mean(enc_text, text_mask, dim=1)
-        speech_latents = masked_mean(enc_speech, voice_mask, dim=1)
-
-        text_latents = self.to_text_latent(text_latents).float()
-        speech_latents = self.to_speech_latent(speech_latents).float()
+        text_latents = self.to_text_latent(enc_text)
+        speech_latents = self.to_speech_latent(enc_speech)
 
         text_latents, speech_latents = map(lambda t: F.normalize(t, p=2, dim=-1), (text_latents, speech_latents))
-
         temp = self.temperature.exp()
 
         if not return_loss:
@@ -345,18 +278,32 @@ class CLVP(nn.Module):
             return sim
 
         sim = einsum('i d, j d -> i j', text_latents, speech_latents) * temp
-        labels = torch.arange(b, device=device)
+        labels = torch.arange(text_latents.shape[0], device=device)
         loss = (F.cross_entropy(sim, labels) + F.cross_entropy(sim.t(), labels)) / 2
+
+        # Involve probabilistic or possibly unused parameters in loss so we don't get DDP errors.
+        extraneous_addition = 0
+        for p in unused_params:
+            extraneous_addition = extraneous_addition + p.mean()
+        loss = loss + extraneous_addition * 0
         return loss
+
+    def get_speech_projection(self, mel):
+        speech_emb = self.speech_emb(mel).permute(0,2,1)
+        enc_speech = self.speech_transformer(speech_emb)
+        speech_latents = self.to_speech_latent(enc_speech)
+        return speech_latents
 
 
 class CLVPMetric:
     def __init__(self, device='cpu', pretrained_path='.data/clvp.pth'):
         self.device = device
-        self.model = CLVP(dim_text=512, dim_latent=512, dim_speech=512, num_text_tokens=148, text_enc_depth=8,
-                          text_seq_len=400, text_heads=8, speech_enc_depth=10, speech_heads=8, speech_seq_len=1000).eval().to(device)
+        self.model = CLVP(model_dim=512, transformer_heads=8, dropout=0, num_text_tokens=256, text_enc_depth=8,
+                          text_mask_percentage=0, conditioning_enc_depth=4, speech_enc_depth=8,
+                          speech_mask_percentage=0, latent_multiplier=2).eval().to(device)
         sd = torch.load(pretrained_path, map_location=device)
         self.model.load_state_dict(sd)
+        self.tokenizer = VoiceBpeTokenizer()
 
     def compute_frechet_distance(self, proj1, proj2):
         # I really REALLY FUCKING HATE that this is going to numpy. I do it because the `pytorch_fid` repo does it and
@@ -386,17 +333,35 @@ class CLVPMetric:
         real_projections = torch.cat(self.get_projection_for_files(real_files, verbose), dim=0)
         return self.compute_frechet_distance(gen_projections, real_projections)
 
-    def compute_clvp(self, tsv, verbose=True):
+    def compute_clvp(self, tsv, real_dir, verbose=True):
         with torch.no_grad():
             paths_and_text = load_tsv(tsv)
             ces = []
             for path, text in tqdm(paths_and_text, disable=not verbose):
                 audio = load_audio(str(path), 22050).to(self.device)[:1]  # Only take the first channel (if multiple are present)
                 mel = to_mel(audio).unsqueeze(0)
-                ces.append(self.model(torch.tensor(text_to_sequence(text), device=self.device).unsqueeze(0), mel, False))
+                real_path = os.path.join(real_dir, os.path.basename(str(path)))
+                cond_audio = load_audio(real_path, 22050).to(self.device)[:1]
+                cond_mel = to_mel(cond_audio).unsqueeze(0)
+                text_codes = torch.tensor(self.tokenizer.encode(text), device=self.device).unsqueeze(0)
+                ces.append(self.model(text_codes, mel, cond_mel, False))
             return torch.stack(ces).mean()
 
 
 if __name__ == '__main__':
-    metric = CLVPMetric(device='cuda')
-    print(metric.compute_fd('D:\\tmp\\tortoise-tts-eval\\redo_outlier', 'D:\\tmp\\tortoise-tts-eval\\real'))
+    clvp = CLVP()
+    clvp(torch.randint(0,256,(2,120)),
+         torch.randn(2,80,100),
+         torch.randn(2,80,95),
+         return_loss=True)
+    nonloss = clvp(torch.randint(0,256,(2,120)),
+         torch.randn(2,80,100),
+         torch.randn(2,80,95),
+         return_loss=False)
+    clvp.get_speech_projection(torch.randn(2,80,95))
+    clvp = CLVP(mel_codes=8192)
+    clvp(torch.randint(0,256,(2,120)),
+         torch.randint(0,8192,(2,150)),
+         torch.randn(2,80,95),
+         return_loss=True)
+    print(nonloss.shape)

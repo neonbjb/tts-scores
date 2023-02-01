@@ -7,6 +7,8 @@ import re
 
 import inflect
 # Regular expression matching whitespace:
+import torch
+from tokenizers import Tokenizer
 from unidecode import unidecode
 
 _pad        = '_'
@@ -199,3 +201,45 @@ def text_to_sequence(text, cleaner_names=['english_cleaners']):
     text = m.group(3)
 
   return sequence
+
+
+def remove_extraneous_punctuation(word):
+    replacement_punctuation = {
+        '{': '(', '}': ')',
+        '[': '(', ']': ')',
+        '`': '\'', '—': '-',
+        '—': '-', '`': '\'',
+        'ʼ': '\''
+    }
+    replace = re.compile("|".join([re.escape(k) for k in sorted(replacement_punctuation, key=len, reverse=True)]), flags=re.DOTALL)
+    word = replace.sub(lambda x: replacement_punctuation[x.group(0)], word)
+
+    # TODO: some of these are spoken ('@', '%', '+', etc). Integrate them into the cleaners.
+    extraneous = re.compile(r'^[@#%_=\$\^&\*\+\\]$')
+    word = extraneous.sub('', word)
+    return word
+
+
+class VoiceBpeTokenizer:
+    def __init__(self):
+          self.tokenizer = Tokenizer.from_file('.data/clvp_tok.json')
+
+    def preprocess_text(self, txt):
+        txt = english_cleaners(txt)
+        txt = remove_extraneous_punctuation(txt)
+        return txt
+
+    def encode(self, txt):
+        txt = self.preprocess_text(txt)
+        txt = txt.replace(' ', '[SPACE]')
+        return self.tokenizer.encode(txt).ids
+
+    def decode(self, seq):
+        if isinstance(seq, torch.Tensor):
+            seq = seq.cpu().numpy()
+        txt = self.tokenizer.decode(seq, skip_special_tokens=False).replace(' ', '')
+        txt = txt.replace('[SPACE]', ' ')
+        txt = txt.replace('[STOP]', '')
+        txt = txt.replace('[UNK]', '')
+
+        return txt
