@@ -54,6 +54,18 @@ cv_metric = CLVPMetric(device='cuda')
 score = cv_metric.compute_fd('<path_to_your_generated_audio>, '<path_to_your_real_audio>')
 ```
 
+### TSV format
+
+The TSV input is a tab-separated-value file. Each line must contain a transcript followed by a tab, followed by
+a filename. It can be optionally followed by more tab separated values, only the first two are important:
+
+```
+<transcript1><|tab|><filename1><|tab|>....
+<transcript2><|tab|><filename2><|tab|>....
+...
+<transcriptN><|tab|><filenameN><|tab|>....
+```
+
 ## wav2vec2 Intelligibility Score
 
 One rather obvious way to compute the performance of a TTS system that I have not seen before is to leverage an ASR
