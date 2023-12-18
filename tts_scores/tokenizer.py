@@ -221,8 +221,8 @@ def remove_extraneous_punctuation(word):
 
 
 class VoiceBpeTokenizer:
-    def __init__(self):
-          self.tokenizer = Tokenizer.from_file('.data/clvp_tok.json')
+    def __init__(self, tok_path='.data/clvp_tok.json'):
+          self.tokenizer = Tokenizer.from_file(tok_path)
 
     def preprocess_text(self, txt):
         txt = english_cleaners(txt)
