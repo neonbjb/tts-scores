@@ -296,14 +296,14 @@ class CLVP(nn.Module):
 
 
 class CLVPMetric:
-    def __init__(self, device='cpu', pretrained_path='.data/clvp.pth'):
+    def __init__(self, device='cpu', pretrained_path='.data/clvp.pth', tok_path='.data/clvp_tok.json'):
         self.device = device
         self.model = CLVP(model_dim=512, transformer_heads=8, dropout=0, num_text_tokens=256, text_enc_depth=8,
                           text_mask_percentage=0, conditioning_enc_depth=4, speech_enc_depth=8,
                           speech_mask_percentage=0, latent_multiplier=2).eval().to(device)
         sd = torch.load(pretrained_path, map_location=device)
         self.model.load_state_dict(sd)
-        self.tokenizer = VoiceBpeTokenizer()
+        self.tokenizer = VoiceBpeTokenizer(tok_path)
 
     def compute_frechet_distance(self, proj1, proj2):
         # I really REALLY FUCKING HATE that this is going to numpy. I do it because the `pytorch_fid` repo does it and
@@ -336,6 +336,19 @@ class CLVPMetric:
     def compute_clvp(self, tsv, real_dir, verbose=True):
         with torch.no_grad():
             paths_and_text = load_tsv(tsv)
+            ces = []
+            for path, text in tqdm(paths_and_text, disable=not verbose):
+                audio = load_audio(str(path), 22050).to(self.device)[:1]  # Only take the first channel (if multiple are present)
+                mel = to_mel(audio).unsqueeze(0)
+                real_path = os.path.join(real_dir, os.path.basename(str(path)))
+                cond_audio = load_audio(real_path, 22050).to(self.device)[:1]
+                cond_mel = to_mel(cond_audio).unsqueeze(0)
+                text_codes = torch.tensor(self.tokenizer.encode(text), device=self.device).unsqueeze(0)
+                ces.append(self.model(text_codes, mel, cond_mel, False))
+            return torch.stack(ces).mean()
+            
+    def compute_clvp_directly(self, paths_and_text, real_dir, verbose=True):
+        with torch.no_grad():
             ces = []
             for path, text in tqdm(paths_and_text, disable=not verbose):
                 audio = load_audio(str(path), 22050).to(self.device)[:1]  # Only take the first channel (if multiple are present)

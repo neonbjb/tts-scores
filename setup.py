@@ -6,7 +6,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 setuptools.setup(
     name="tts-scores",
     packages=["tts_scores"],
-    version="1.0.0",
+    version="1.0.1",
     author="James",
     author_email="james@adamant.ai",
     description="A library for computing performance metrics for text-to-speech systems",
@@ -26,6 +26,7 @@ setuptools.setup(
         'unidecode',
         'inflect',
         'pytorch_fid',
+        'entmax',
         'einops'
     ],
     classifiers=[

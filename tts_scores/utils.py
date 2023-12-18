@@ -24,7 +24,7 @@ def load_audio(audiopath, sampling_rate):
     if audiopath[-4:] == '.wav':
         audio, lsr = load_wav_to_torch(audiopath)
     else:
-        raise RuntimeError
+        raise RuntimeError(f"Audio path {audiopath} does not end with .wav")
 
     # Remove any channel data.
     if len(audio.shape) > 1:
