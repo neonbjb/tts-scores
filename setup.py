@@ -26,7 +26,8 @@ setuptools.setup(
         'unidecode',
         'inflect',
         'pytorch_fid',
-        'einops'
+        'einops',
+        'entmax'
     ],
     classifiers=[
         "Programming Language :: Python :: 3",
