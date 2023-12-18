@@ -346,6 +346,19 @@ class CLVPMetric:
                 text_codes = torch.tensor(self.tokenizer.encode(text), device=self.device).unsqueeze(0)
                 ces.append(self.model(text_codes, mel, cond_mel, False))
             return torch.stack(ces).mean()
+            
+    def compute_clvp_directly(self, paths_and_text, real_dir, verbose=True):
+        with torch.no_grad():
+            ces = []
+            for path, text in tqdm(paths_and_text, disable=not verbose):
+                audio = load_audio(str(path), 22050).to(self.device)[:1]  # Only take the first channel (if multiple are present)
+                mel = to_mel(audio).unsqueeze(0)
+                real_path = os.path.join(real_dir, os.path.basename(str(path)))
+                cond_audio = load_audio(real_path, 22050).to(self.device)[:1]
+                cond_mel = to_mel(cond_audio).unsqueeze(0)
+                text_codes = torch.tensor(self.tokenizer.encode(text), device=self.device).unsqueeze(0)
+                ces.append(self.model(text_codes, mel, cond_mel, False))
+            return torch.stack(ces).mean()
 
 
 if __name__ == '__main__':
