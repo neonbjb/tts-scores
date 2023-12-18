@@ -296,14 +296,14 @@ class CLVP(nn.Module):
 
 
 class CLVPMetric:
-    def __init__(self, device='cpu', pretrained_path='.data/clvp.pth'):
+    def __init__(self, device='cpu', pretrained_path='.data/clvp.pth', tok_path='.data/clvp_tok.json'):
         self.device = device
         self.model = CLVP(model_dim=512, transformer_heads=8, dropout=0, num_text_tokens=256, text_enc_depth=8,
                           text_mask_percentage=0, conditioning_enc_depth=4, speech_enc_depth=8,
                           speech_mask_percentage=0, latent_multiplier=2).eval().to(device)
         sd = torch.load(pretrained_path, map_location=device)
         self.model.load_state_dict(sd)
-        self.tokenizer = VoiceBpeTokenizer()
+        self.tokenizer = VoiceBpeTokenizer(tok_path)
 
     def compute_frechet_distance(self, proj1, proj2):
         # I really REALLY FUCKING HATE that this is going to numpy. I do it because the `pytorch_fid` repo does it and
