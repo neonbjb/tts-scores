@@ -52,3 +52,29 @@ class IntelligibilityMetric:
                 continue
             ils.append(il)
         return torch.stack(ils).mean()
+        
+    def compute_intelligibility_directly(self, paths_and_text, real_base_dir=None, verbose=True):
+        """
+        Computes the intelligibility score and returns it.
+        :param tsv_file: A path to a Tab-Separated-Value file that follows this format:
+                         {transcription}\t{relative path to TTS audio file}\n
+        :param real_base_dir: A folder containing real spoken audio files, with the same basenames as the TTS-generated
+                              audio files from the tsv_file above. If None, one-sided intelligibility will be computed,
+                              which does not take into account natural intelligibility losses from the ground truth data.
+        :param verbose: When true, a TQDM bar showing metric computation status will be shown.
+        :return: The mean intelligibility score for the provided data.
+        """
+        ils = []
+        for path, text in tqdm(paths_and_text, disable=not verbose):
+            text_codes = torch.tensor(text_to_sequence(text), device=self.device)
+            audio = load_audio(str(path), 16000).to(self.device)[:1]
+            il = self.fetch_ctc_loss(audio, text_codes)
+            if real_base_dir is not None:
+                real_path = os.path.join(real_base_dir, os.path.basename(path))
+                assert os.path.exists(real_path), real_path
+                real_audio = load_audio(str(real_path), 16000).to(self.device)[:1]
+                il = il - self.fetch_ctc_loss(real_audio, text_codes)
+            if torch.isnan(il) or torch.isinf(il):
+                continue
+            ils.append(il)
+        return torch.stack(ils).mean()
