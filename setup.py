@@ -26,6 +26,7 @@ setuptools.setup(
         'unidecode',
         'inflect',
         'pytorch_fid',
+        'entmax',
         'einops'
     ],
     classifiers=[
